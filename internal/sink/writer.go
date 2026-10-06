@@ -18,7 +18,10 @@ type Destination interface {
 }
 
 // Dropped 记录一条被放弃的数据及其原因。
+// Seq 仅由 PersistentWriter 填充（日志序号，用于手动处置与重放对账）；
+// 内存版 Writer 不使用该字段，恒为 0。
 type Dropped struct {
+	Seq    uint64
 	Item   []byte
 	Reason string
 }

@@ -6,8 +6,8 @@
 |---|---|
 | `internal/metrics` | 并发安全的时间序列注册表（指标采集） |
 | `internal/alert`   | 支持运行期规则变更的告警判定引擎 |
-| `internal/sink`    | 带背压与放弃说明的缓冲结果写出器 |
-| `internal/integration` | 并发写入 + 规则变更 + 写出失败交织的端到端测试 |
+| `internal/sink`    | 带背压与放弃说明的缓冲结果写出器；含跨重启续投的持久写出器 |
+| `internal/integration` | 并发写入 + 规则变更 + 写出失败交织的端到端测试；引擎事件跨重启续投的端到端测试 |
 
 ## 指标与标签模型
 
@@ -61,6 +61,59 @@
   并冲刷完缓冲区中所有已接受数据后才返回。
 - 后台冲刷协程按序写出，单条数据重试 `maxRetry` 次仍失败才放弃并记录原因。
 
+## 跨重启续投（持久写出器）
+
+`sink.PersistentWriter` 在 `Writer` 的三种结果语义之上叠加落盘日志
+（`internal/sink/journal.go`，JSON Lines，每条记录写盘后 fsync）：
+
+```go
+w, err := sink.OpenPersistentWriter(dest, "data/queue.journal", capacity, maxRetry)
+```
+
+- **接受即落盘**：`Write` 返回 `nil` 前，enqueue 记录已 fsync。正常重启或硬杀
+  （`kill -9`）后，已接受但未确认的数据不丢。
+- **按序续投**：重启时 `OpenPersistentWriter` 重放日志，未确认的数据按原 seq
+  （即原接受先后）重新进入积压队首，继续往下游送。
+- **确认不重发**：下游写成功后先落 ack 记录（fsync）再把数据移出积压；
+  已 ack 的数据重启后绝不重发。注意"确认"以 ack 落盘为准——下游已写成功但
+  ack 尚未落盘的崩溃窗口内，该条会被重投一次（at-least-once 的固有边界）。
+- **放弃不翻出**：重试放弃时落 drop 记录（附原因），重启后放弃列表原样重建，
+  但绝不会被重新写出。
+- **恢复期间反馈不变**：重放恢复的积压照常占用容量，满了新写入返回
+  `sink.ErrBusy`；`Close` 后返回 `sink.ErrClosed`；下游持续失败仍按
+  `maxRetry` 放弃并附原因。三种反馈与容量上限在恢复补投期间一样成立。
+- **日志压缩**：失效记录（ack/drop/purge）超过阈值（默认 4096）时，用当前
+  存活记录原子重写日志（临时文件 + rename），长期运行日志不无限增长。
+
+## 积压观测与手动处置
+
+`PersistentWriter.Stats()` 返回 `BacklogStats`：
+
+| 字段 | 含义 |
+|---|---|
+| `Pending` | 等待写出的条数 |
+| `OldestAge` | 最老一条已等待的时长（接受时间随日志落盘，重启后连续累计） |
+| `Blocked` | 当前是否被下游拖着（最近一次写出处于失败重试中） |
+| `Dropped` / `DropReasons` | 已放弃条数及按原因分布 |
+| `Capacity` | 积压容量上限 |
+
+统计全部来自日志重放所重建的状态，**重启前后口径连续，不会归零**。
+
+手动处置入口（与自动流程同一冲刷路径，顺序与去重规则一致）：
+
+- `Requeue(n)`：把最老的至多 n 条已放弃数据重新排入积压队尾（新 seq、
+  落盘 enq + purge 旧 drop），返回实际重投条数。
+- `Discard(n)`：把最老的至多 n 条已放弃数据永久丢弃（落盘 purge），
+  重启后不再出现，返回实际丢弃条数。
+
+## 兼容范围
+
+- 上一版本的 `sink.Writer`（纯内存）API 与语义完全不变，可继续直接使用。
+- 持久化是**新增能力**：老版本没有任何落盘数据，不存在数据迁移问题；
+  首次使用 `OpenPersistentWriter` 时日志文件从零创建。
+- 日志格式为 v1（JSON Lines，enq/ack/drop/purge 四类记录）；`Dropped` 结构
+  新增 `Seq` 字段，内存版 `Writer` 恒为 0，不影响既有调用方。
+
 ## 本地验证
 
 ```bash
@@ -70,8 +123,9 @@ go build ./... && go vet ./...
 # 全部测试（含竞态检测），日志打印输入、状态变化与判定依据
 go test ./... -race -v
 
-# 只跑端到端交织场景
-go test ./internal/integration/ -race -v
+# 只跑跨重启续投相关用例
+go test ./internal/sink/ -race -v -run 'TestResume|TestAcked|TestDropped|TestBacklog|TestManual|TestCapacity|TestJournal'
+go test ./internal/integration/ -race -v -run TestEngineEventsSurviveRestart
 ```
 
 测试覆盖：
@@ -81,5 +135,10 @@ go test ./internal/integration/ -race -v
   不重复触发；并发评估与规则变更交织下 Fired/Resolved 守恒。
 - `internal/sink`：缓冲区满返回 `ErrBusy`；下游持续失败放弃并附原因；
   恢复后不回写已放弃数据；并发写出守恒且无重复。
+  持久写出器：跑到一半硬杀后按原顺序续投；已确认数据重启后零重发；
+  已放弃数据重启后不翻出且原因保留；积压条数/最老等待时长/放弃统计跨重启连续；
+  手动重投按序写出、手动丢弃跨重启生效；恢复补投期间容量上限与三种反馈照常；
+  日志压缩后状态完整。
 - `internal/integration`：并发写入 + 采样期规则变更 + 下游间歇失败三者交织，
-  校验指标总量等价串行基准、事件流严格交替、写出/放弃守恒。
+  校验指标总量等价串行基准、事件流严格交替、写出/放弃守恒；
+  引擎事件流跑到一半硬杀、平台重启后续投，全程 写出+放弃=接受 守恒且无重复。
